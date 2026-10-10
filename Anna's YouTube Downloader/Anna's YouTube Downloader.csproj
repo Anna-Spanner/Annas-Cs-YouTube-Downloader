@@ -9,4 +9,8 @@
     <ApplicationIcon>Icon.ico</ApplicationIcon>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Program.cs" Link="Program.cs" />
+  </ItemGroup>
+
 </Project>

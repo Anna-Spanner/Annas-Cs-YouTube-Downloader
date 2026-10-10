@@ -37,16 +37,18 @@ async Task checkSelfForUpdates()
     
     string updaterName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "updater.exe" : "updater";
 
-    await File.WriteAllBytesAsync(updaterName, await client.GetByteArrayAsync(url));
+    string updaterPath = AppConfig.ResolveAppPath(updaterName);
+    await File.WriteAllBytesAsync(updaterPath, await client.GetByteArrayAsync(url));
     Console.WriteLine("File downloaded! This app will now close to self-update");
     if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
     {
-        File.SetUnixFileMode(updaterName, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        File.SetUnixFileMode(updaterPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
     Process.Start(new ProcessStartInfo
     {
-        FileName = $"./{updaterName}",
+        FileName = updaterPath,
         Arguments = appConfig.Version,
+        WorkingDirectory = AppConfig.ApplicationDirectory,
         UseShellExecute = true
     });
     Environment.Exit(0);
@@ -59,6 +61,7 @@ async Task updateYtDlp()
     {
         FileName = appConfig.YtDlp,
         Arguments = "-U",
+        WorkingDirectory = AppConfig.ApplicationDirectory,
         RedirectStandardOutput = true,
         RedirectStandardError = true,
         UseShellExecute = false,
@@ -88,9 +91,6 @@ async Task updateFfmpeg()
 {
     string? ffmpegFolder = Directory.GetParent(appConfig.Ffmpeg)?.ToString();
     ArgumentNullException.ThrowIfNullOrEmpty(ffmpegFolder);
-    string? parentFolder = Directory.GetParent(ffmpegFolder)?.ToString();
-    ArgumentNullException.ThrowIfNullOrEmpty(parentFolder);
-    
     string ffmpegZip = "ffmpeg.zip";
     string baseUrl = "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest";
     using HttpClient client = new HttpClient();
@@ -118,7 +118,7 @@ async Task updateFfmpeg()
         isZip = false;
     }
     byte[] fileBytes = await client.GetByteArrayAsync(url);
-    string tempPath = Path.Combine(parentFolder, "/temp");
+    string tempPath = AppConfig.ResolveAppPath("temp");
     string downloadPath = Path.Combine(tempPath, ffmpegZip);
     Directory.CreateDirectory(tempPath);
     await File.WriteAllBytesAsync(downloadPath, fileBytes);
@@ -132,7 +132,11 @@ async Task updateFfmpeg()
     }
     else
     {
-        var psi = new ProcessStartInfo("tar", $"-xf {downloadPath} -C {ffmpegFolder}") {CreateNoWindow = true};
+        var psi = new ProcessStartInfo("tar", $"-xf \"{downloadPath}\" -C \"{ffmpegFolder}\"")
+        {
+            CreateNoWindow = true,
+            WorkingDirectory = AppConfig.ApplicationDirectory
+        };
         using Process? process = Process.Start(psi);
         ArgumentNullException.ThrowIfNull(process);
         process.WaitForExit();
@@ -164,10 +168,7 @@ async Task updateDeno()
 
     string? denoFolder = Directory.GetParent(appConfig.Deno)?.ToString();
     ArgumentNullException.ThrowIfNullOrEmpty(denoFolder);
-    string? parentFolder = Directory.GetParent(denoFolder)?.ToString();
-    ArgumentNullException.ThrowIfNullOrEmpty(parentFolder);
-
-    string tempPath = Path.Combine(parentFolder, "temp_deno");
+    string tempPath = AppConfig.ResolveAppPath("temp_deno");
 
     try
     {
@@ -235,6 +236,7 @@ async Task<(bool, string)> isLinkPlaylist(string url)
     {
         FileName = appConfig.YtDlp,
         Arguments = $"-J --flat-playlist \"{url}\" --js-runtimes \"deno:{appConfig.Deno}\"",
+        WorkingDirectory = AppConfig.ApplicationDirectory,
         RedirectStandardOutput = true,
         UseShellExecute = false,
         CreateNoWindow = true
@@ -264,6 +266,7 @@ async Task<(string videoID, string audioID)> promptStreams(string url)
     {
         FileName = appConfig.YtDlp,
         Arguments = $"-J \"{url}\" --js-runtimes \"deno:{appConfig.Deno}\"",
+        WorkingDirectory = AppConfig.ApplicationDirectory,
         RedirectStandardOutput = true,
         UseShellExecute = false,
         CreateNoWindow = true
@@ -512,24 +515,30 @@ try
 
 class AppConfig
 {
-    private const string ConfigLocation = "config.json";
-    private const string TempConfigLocation = "config.json.temp";
+    public static string ApplicationDirectory {get;} = Path.GetFullPath(AppContext.BaseDirectory);
+    private static readonly string ConfigLocation = ResolveAppPath("config.json");
+    private static readonly string TempConfigLocation = ResolveAppPath("config.json.temp");
     private static readonly JsonSerializerOptions JsonWriteIndented = new() {WriteIndented = true};
     private static readonly AppJsonContext JsonContext = new(JsonWriteIndented);
     public bool ErrorOccurredDuringStartup;
 
     public readonly string  Version = "2.4";
     public bool UpdateReqsOnStartup {get; set;} = true;
-    public string YtDlp {get; set;} = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "./yt-dlp.exe" : "./yt-dlp";
-    public string Ffmpeg {get; set;} = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "./ffmpeg/ffmpeg.exe" : "./ffmpeg/ffmpeg";
+    public string YtDlp {get; set;} = ResolveAppPath(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "yt-dlp.exe" : "yt-dlp");
+    public string Ffmpeg {get; set;} = ResolveAppPath(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? Path.Combine("ffmpeg", "ffmpeg.exe") : Path.Combine("ffmpeg", "ffmpeg"));
     public string FfmpegLatestVersion {get; set;} = "";
-    public string Deno {get; set;} = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "./deno/deno.exe" : "./deno/deno";
+    public string Deno {get; set;} = ResolveAppPath(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? Path.Combine("deno", "deno.exe") : Path.Combine("deno", "deno"));
     public string DenoLatestVersion {get; set;} = "";
     public bool SaveNameEachTime {get; set;} = true;
     public string LastUsedName {get; set;} = "";
     public string DownloadsFolder {get; set;} = GetDownloadsFolder();
 
     private readonly string AppendToDownloads = "Annas YT Downloader";
+
+    public static string ResolveAppPath(string path)
+    {
+        return Path.GetFullPath(path, ApplicationDirectory);
+    }
 
     private static string GetDownloadsFolder()
     {
@@ -551,7 +560,7 @@ class AppConfig
                 Console.WriteLine("Old config file found from failed overwrite... Deleting");
                 File.Delete(TempConfigLocation);
             }
-            if (File.Exists(ConfigLocation)) {MoveConfigBeforeOverwrite("./Configs/Old Config Files");}
+            if (File.Exists(ConfigLocation)) {MoveConfigBeforeOverwrite(ResolveAppPath(Path.Combine("Configs", "Old Config Files")));}
 
             File.WriteAllText(TempConfigLocation, JsonSerializer.Serialize(this, JsonContext.AppConfig));
             File.Move(TempConfigLocation, ConfigLocation);
@@ -569,8 +578,13 @@ class AppConfig
         try
         {
             if (!File.Exists(ConfigLocation)) {throw new NoConfigFileFound();}
-            return JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(ConfigLocation), AppJsonContext.Default.AppConfig)
+            AppConfig loadedConfig = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(ConfigLocation), AppJsonContext.Default.AppConfig)
                 ?? throw new NoConfigFileFound();
+            loadedConfig.YtDlp = ResolveAppPath(loadedConfig.YtDlp);
+            loadedConfig.Ffmpeg = ResolveAppPath(loadedConfig.Ffmpeg);
+            loadedConfig.Deno = ResolveAppPath(loadedConfig.Deno);
+            loadedConfig.DownloadsFolder = ResolveAppPath(loadedConfig.DownloadsFolder);
+            return loadedConfig;
         }
         catch (NoConfigFileFound)
         {
@@ -582,7 +596,7 @@ class AppConfig
             Console.WriteLine($"An error occured when loading the app config, moving the file before writing defaults: {e.Message}");
             try
             {
-                MoveConfigBeforeOverwrite("./Configs/Broken Config Files");
+                MoveConfigBeforeOverwrite(ResolveAppPath(Path.Combine("Configs", "Broken Config Files")));
             }
             catch (Exception innerE)
             {
@@ -609,7 +623,7 @@ class AppConfig
             Directory.CreateDirectory(dirToMoveTo);
         }
 
-        string destinationName = ConfigLocation;
+        string destinationName = Path.GetFileName(ConfigLocation);
         if (files.Length > 0)
         {
             foreach (string file in files)
@@ -730,7 +744,7 @@ class MediaDownloader
             }}
         }
 
-        string args = $"-P \"{downloadPath}\" -f \"{formatSelection}\" {playlistFlag} {processingArgs} -o \"{outputNamingTemplate}\" --js-runtimes \"deno:{appConfig.Deno}\" --newline --progress-template \"{progressTemplate}\" --progress-delta 0.03 --ffmpeg-location \"./ffmpeg/ffmpeg.exe\" \"{Url}\"";
+        string args = $"-P \"{downloadPath}\" -f \"{formatSelection}\" {playlistFlag} {processingArgs} -o \"{outputNamingTemplate}\" --js-runtimes \"deno:{appConfig.Deno}\" --newline --progress-template \"{progressTemplate}\" --progress-delta 0.03 --ffmpeg-location \"{appConfig.Ffmpeg}\" \"{Url}\"";
         ExecuteDownload(appConfig.YtDlp, args);
     }
 
@@ -740,6 +754,7 @@ class MediaDownloader
         {
             FileName = executable,
             Arguments = args,
+            WorkingDirectory = AppConfig.ApplicationDirectory,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,

@@ -1,10 +1,12 @@
 ﻿// See https://aka.ms/new-console-template for more information
 using System.Diagnostics;
-using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using SharpCompress.Archives;
+using SharpCompress.Common;
 
 var appConfig = new AppConfig();
 bool errorOccuredDuringStartup = false;
@@ -20,38 +22,101 @@ var audioFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     "aac", "alac", "flac", "m4a", "mp3", "ogg", "opus", "wav"
 };
 
-async Task checkSelfForUpdates() 
+async Task<UpdateInfo> getLatestUpdateInfo()
 {
     using var client = new HttpClient();
     string json = await client.GetStringAsync("https://annaspannertechsolutions.uk/annas-youtube-downloader/latest");
-    UpdateInfo updateInfo = JsonSerializer.Deserialize<UpdateInfo>(json, new JsonSerializerOptions {PropertyNameCaseInsensitive = true})!;
-    
-    if (Version.Parse(updateInfo.LatestVersion) <= Version.Parse(appConfig.Version)) {return;}
+    return JsonSerializer.Deserialize(json, AppJsonContext.Default.UpdateInfo)
+        ?? throw new InvalidDataException("The update server returned an empty response.");
+}
 
-    Console.Write("An update was found to this app! Would you like to install it? (Y/n) ->");
-    if (Console.ReadLine()!.ToLower() == "n") {return;}
-    Console.WriteLine("Downloading patch...");
-    
-    string url = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? updateInfo.WindowsUpdaterUrl :
-        RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? updateInfo.MacUpdaterUrl : updateInfo.LinuxUpdaterUrl;
-    
-    string updaterName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "updater.exe" : "updater";
+async Task<bool> checkSelfForUpdates(UpdateInfo updateInfo)
+{
+    ReleaseInfo? release = updateInfo.Self;
+    if (release is null || string.IsNullOrWhiteSpace(release.LatestVersion) || release.LatestVersion == appConfig.Version) {return true;}
 
-    string updaterPath = AppConfig.ResolveAppPath(updaterName);
-    await File.WriteAllBytesAsync(updaterPath, await client.GetByteArrayAsync(url));
-    Console.WriteLine("File downloaded! This app will now close to self-update");
-    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+    DependencyDownload? updaterDownload = release.GetDownload(
+        RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+        RuntimeInformation.IsOSPlatform(OSPlatform.OSX),
+        RuntimeInformation.OSArchitecture);
+    if (updaterDownload is null)
     {
-        File.SetUnixFileMode(updaterPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        Console.WriteLine("An app update is available, but no download is configured for this platform.");
+        return true;
     }
-    Process.Start(new ProcessStartInfo
+
+    using var client = new HttpClient();
+    Console.Write("An update was found to this app! Would you like to install it? (Y/n) ->");
+    if (Console.ReadLine()!.ToLower() == "n") {return true;}
+    Console.WriteLine("Downloading patch...");
+
+    string updaterName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "updater.exe" : "updater";
+    string updaterFolder = Path.Combine(Path.GetTempPath(), $"AnnasYTUpdater-{Guid.NewGuid():N}");
+    string updaterPath = Path.Combine(updaterFolder, updaterName);
+    Directory.CreateDirectory(updaterFolder);
+
+    try
     {
-        FileName = updaterPath,
-        Arguments = appConfig.Version,
-        WorkingDirectory = AppConfig.ApplicationDirectory,
-        UseShellExecute = true
-    });
-    Environment.Exit(0);
+        try
+        {
+            await downloadAndVerify(client, updaterDownload.Url!, updaterPath, updaterDownload.Sha256!);
+        }
+        catch (Exception e) when (e is InvalidDataException or FormatException)
+        {
+            appConfig.UpdateReqsOnStartup = false;
+            appConfig.Save();
+            Console.WriteLine($"The self-updater failed SHA-256 verification or has invalid hash metadata. Automatic updates have been disabled in the config, please let Anna-Rose know! Details: {e.Message}");
+            return false;
+        }
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            File.SetUnixFileMode(updaterPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        var processInfo = new ProcessStartInfo
+        {
+            FileName = updaterPath,
+            WorkingDirectory = updaterFolder,
+            UseShellExecute = true
+        };
+        processInfo.ArgumentList.Add(AppConfig.ApplicationDirectory);
+        if (Process.Start(processInfo) is null) {throw new InvalidOperationException("The self-updater process could not be started.");}
+
+        Console.WriteLine("Updater started. This application will now close.");
+        Environment.Exit(0);
+        return true;
+    }
+    finally
+    {
+        if (Directory.Exists(updaterFolder)) {Directory.Delete(updaterFolder, true);}
+    }
+}
+
+async Task downloadAndVerify(HttpClient client, string downloadLink, string destinationPath, string expectedSha256)
+{
+    if (!Uri.TryCreate(downloadLink, UriKind.Absolute, out Uri? downloadUri) || string.IsNullOrWhiteSpace(expectedSha256))
+    {
+        throw new InvalidDataException("The download URL or SHA-256 hash is missing.");
+    }
+
+    byte[] expectedHash = Convert.FromHexString(expectedSha256.Trim().Replace("sha256:", "", StringComparison.OrdinalIgnoreCase));
+    if (expectedHash.Length != 32) {throw new InvalidDataException("The expected SHA-256 hash must contain 64 hexadecimal characters.");}
+
+    using (HttpResponseMessage response = await client.GetAsync(downloadUri, HttpCompletionOption.ResponseHeadersRead))
+    {
+        response.EnsureSuccessStatusCode();
+        await using Stream responseStream = await response.Content.ReadAsStreamAsync();
+        await using FileStream outputStream = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
+        await responseStream.CopyToAsync(outputStream);
+    }
+
+    await using FileStream downloadedStream = File.OpenRead(destinationPath);
+    byte[] actualHash = await SHA256.HashDataAsync(downloadedStream);
+    if (!CryptographicOperations.FixedTimeEquals(actualHash, expectedHash))
+    {
+        File.Delete(destinationPath);
+        throw new InvalidDataException("The downloaded file's SHA-256 hash does not match the server response.");
+    }
 }
 
 async Task updateYtDlp()
@@ -87,146 +152,87 @@ async Task updateYtDlp()
     }
 }
 
-async Task updateFfmpeg()
+async Task<bool> updateDependency(string dependancy, string downloadLink, string expectedSha256)
 {
-    string? ffmpegFolder = Directory.GetParent(appConfig.Ffmpeg)?.ToString();
-    ArgumentNullException.ThrowIfNullOrEmpty(ffmpegFolder);
-    string ffmpegZip = "ffmpeg.zip";
-    string baseUrl = "https://api.github.com/repos/yt-dlp/FFmpeg-Builds/releases/latest";
-    using HttpClient client = new HttpClient();
-    client.DefaultRequestHeaders.Add("User-Agent", "AnnaSpanner C# Applicaiton");
-    
-    string json = await client.GetStringAsync(baseUrl);
-    string latestReleaseDate = "";
-    
-    using (JsonDocument document = JsonDocument.Parse(json))
+    string lDependancy = dependancy.ToLowerInvariant();
+    string installedPath = lDependancy switch
     {
-        latestReleaseDate = document.RootElement.GetProperty("published_at").GetString() ?? "";
-    }
-    if (appConfig.FfmpegLatestVersion == latestReleaseDate) {return;}
-
-    string url;
-    bool isZip = true;
-    baseUrl = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-";
-
-    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {url = baseUrl + "win64-gpl.zip";}
-    else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) {url = baseUrl + "macos64-gpl.zip";}
-    else
-    {
-        url = baseUrl + "linux64-gpl.tar.xz";
-        ffmpegZip = "ffmpeg.tar.xz";
-        isZip = false;
-    }
-    byte[] fileBytes = await client.GetByteArrayAsync(url);
-    string tempPath = AppConfig.ResolveAppPath("temp");
-    string downloadPath = Path.Combine(tempPath, ffmpegZip);
-    Directory.CreateDirectory(tempPath);
-    await File.WriteAllBytesAsync(downloadPath, fileBytes);
-
-    if (Directory.Exists(ffmpegFolder)) {Directory.Delete(ffmpegFolder, true);}
-    Directory.CreateDirectory(ffmpegFolder);
-
-    if (isZip)
-    {
-        ZipFile.ExtractToDirectory(downloadPath, ffmpegFolder);
-    }
-    else
-    {
-        var psi = new ProcessStartInfo("tar", $"-xf \"{downloadPath}\" -C \"{ffmpegFolder}\"")
-        {
-            CreateNoWindow = true,
-            WorkingDirectory = AppConfig.ApplicationDirectory
-        };
-        using Process? process = Process.Start(psi);
-        ArgumentNullException.ThrowIfNull(process);
-        process.WaitForExit();
-    }
-    File.Delete(downloadPath);
-
-    string ffmpegExtractTemp = Directory.GetDirectories(ffmpegFolder)[0];
-    string bin = Path.Combine(ffmpegExtractTemp, "bin");
-
-    foreach (string file in Directory.GetFiles(bin))
-    {
-        File.Move(file, Path.Combine(ffmpegFolder, Path.GetFileName(file)));
-    }
-    Directory.Delete(ffmpegExtractTemp, true);
-    Directory.Delete(tempPath);
-
-    if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) 
-    {foreach (string file in Directory.GetFiles(ffmpegFolder))
-        {
-         File.SetUnixFileMode(file, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
-        }}
-    
-    appConfig.FfmpegLatestVersion = latestReleaseDate;
-    appConfig.Save();
-}
-
-async Task updateDeno()
-{
-
-    string? denoFolder = Directory.GetParent(appConfig.Deno)?.ToString();
-    ArgumentNullException.ThrowIfNullOrEmpty(denoFolder);
-    string tempPath = AppConfig.ResolveAppPath("temp_deno");
+        "deno" => appConfig.Deno,
+        "ffmpeg" => appConfig.Ffmpeg,
+        _ => throw new ArgumentException("Tool must be 'deno' or 'ffmpeg'.", nameof(dependancy))
+    };
+    string exeName = Path.GetFileName(installedPath);
+    string installFolder = Path.GetDirectoryName(installedPath)!;
+    string tempPath = AppConfig.ResolveAppPath(Path.Combine("temp", $"{lDependancy} update"));
+    string archivePath = "";
 
     try
     {
         using HttpClient client = new HttpClient();
-        client.DefaultRequestHeaders.Add("User-Agent", "AnnaSpanner C# Applicaiton");
-
-        // Query the latest version before downloading anything
-        string json = await client.GetStringAsync("https://api.github.com/repos/denoland/deno/releases/latest");
-        string latestVersion;
-        using (JsonDocument document = JsonDocument.Parse(json))
+        if (!Uri.TryCreate(downloadLink, UriKind.Absolute, out Uri? downloadUri) || string.IsNullOrWhiteSpace(expectedSha256))
         {
-            latestVersion = document.RootElement.GetProperty("tag_name").GetString() ?? "";
+            Console.WriteLine($"Invalid download URL or hash\n    Download link: {downloadLink}\n    Expected hash: {expectedSha256}\nPlease contact Anna-Rose to rectify this: https://annaspannertechsolutions.uk");
+            return false;
         }
 
-        if (appConfig.DenoLatestVersion == latestVersion && File.Exists(appConfig.Deno))
+        string archiveName = Path.GetFileName(downloadUri.LocalPath);
+        if (!archiveName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
+            && !archiveName.EndsWith(".7z", StringComparison.OrdinalIgnoreCase)
+            && !archiveName.EndsWith(".tar.xz", StringComparison.OrdinalIgnoreCase))
         {
-            return;
+            throw new NotSupportedException("The download URL must end in .7z, .zip, or .tar.xz.");
         }
-
-        string assetName;
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {assetName = "deno-x86_64-pc-windows-msvc.zip";}
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            assetName = RuntimeInformation.OSArchitecture == Architecture.Arm64 ? "deno-aarch64-apple-darwin.zip" : "deno-x86_64-apple-darwin.zip";
-        }
-        else
-        {
-            assetName = RuntimeInformation.OSArchitecture == Architecture.Arm64 ? "deno-aarch64-unknown-linux-gnu.zip" : "deno-x86_64-unknown-linux-gnu.zip";
-        }
-
-        string url = $"https://github.com/denoland/deno/releases/download/{latestVersion}/{assetName}";
-        string downloadPath = Path.Combine(tempPath, assetName);
-
-        byte[] fileBytes = await client.GetByteArrayAsync(url);
+        string archiveExtension = archiveName.EndsWith(".tar.xz", StringComparison.OrdinalIgnoreCase) ? ".tar.xz" : Path.GetExtension(archiveName);
         Directory.CreateDirectory(tempPath);
-        await File.WriteAllBytesAsync(downloadPath, fileBytes);
+        archivePath = Path.Combine(tempPath, $"{lDependancy} {Guid.NewGuid():N}{archiveExtension}");
 
-        if (Directory.Exists(denoFolder)) {Directory.Delete(denoFolder, true);}
-        Directory.CreateDirectory(denoFolder);
-        ZipFile.ExtractToDirectory(downloadPath, denoFolder);
+        await downloadAndVerify(client, downloadLink, archivePath, expectedSha256);
+
+        using (var archive = ArchiveFactory.OpenArchive(archivePath))
+        {
+            foreach (var entry in archive.Entries.Where(entry => !entry.IsDirectory))
+            {
+                if (entry.Key is null) {continue;}
+                string outputPath = Path.GetFullPath(Path.Combine(tempPath, entry.Key));
+                if (!outputPath.StartsWith(Path.GetFullPath(tempPath))) {continue;}
+                
+                entry.WriteToDirectory(tempPath, new ExtractionOptions {ExtractFullPath = true, Overwrite = true});
+            }
+        }
+        File.Delete(archivePath);
+        archivePath = "";
+
+        string? executablePath = Directory.EnumerateFiles(tempPath, exeName, SearchOption.AllDirectories).FirstOrDefault();
+        if (executablePath is null) {throw new FileNotFoundException($"The {lDependancy} executable was not found in the archive.");}
+
+        string executableFolder = Path.GetDirectoryName(executablePath)!;
+        string? installParent = Path.GetDirectoryName(installFolder);
+        ArgumentException.ThrowIfNullOrEmpty(installParent);
+        Directory.CreateDirectory(installParent);
+
+        if (Directory.Exists(installFolder)) {Directory.Delete(installFolder, true);}
+        Directory.Move(executableFolder, installFolder);
 
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            File.SetUnixFileMode(appConfig.Deno, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            foreach (string file in Directory.GetFiles(installFolder))
+            {
+                File.SetUnixFileMode(file, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            }
         }
 
-        appConfig.DenoLatestVersion = latestVersion;
-        appConfig.Save();
+        return true;
     }
     catch (Exception e)
     {
-        // Deno is optional, so failures here shouldn't block the rest of the app
-        Console.WriteLine($"\nCouldn't update Deno, continuing without it: {e.Message}");
+        Console.WriteLine($"\nCouldn't update {lDependancy}, continuing without it: {e.Message}");
         errorOccuredDuringStartup = true;
+        return false;
     }
     finally
     {
         if (Directory.Exists(tempPath)) {Directory.Delete(tempPath, true);}
+        if (!string.IsNullOrEmpty(archivePath) && File.Exists(archivePath)) {File.Delete(archivePath);}
     }
 }
 
@@ -359,14 +365,60 @@ async Task run()
     {
         try
         {
+            UpdateInfo updateInfo = await getLatestUpdateInfo();
             Console.Write("\rChecking for updates... Checking self");
-            //await checkSelfForUpdates(); Not ready for beta deployment
+            if (!await checkSelfForUpdates(updateInfo))
+            {
+                throw new InvalidDataException("Self-updater verification failed. Automatic updates were disabled.");
+            }
             Console.Write("\rChecking for updates... This downloader is up to date! Checking Yt-dlp");
             await updateYtDlp();
             Console.Write("\rChecking for updates... This downloader is up to date! Yt-dlp up to date! Checking Ffmpeg");
-            await updateFfmpeg();
+            ReleaseInfo? ffmpegRelease = updateInfo.Ffmpeg;
+            string? ffmpegVersion = ffmpegRelease?.LatestVersion;
+            if (!string.IsNullOrWhiteSpace(ffmpegVersion)
+                && (appConfig.FfmpegLatestVersion != ffmpegVersion || !File.Exists(appConfig.Ffmpeg)))
+            {
+                DependencyDownload? ffmpegDownload = ffmpegRelease!.GetDownload(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), RuntimeInformation.IsOSPlatform(OSPlatform.OSX), RuntimeInformation.OSArchitecture);
+                if (ffmpegDownload is not null && await updateDependency("ffmpeg", ffmpegDownload.Url!, ffmpegDownload.Sha256!))
+                {
+                    appConfig.FfmpegLatestVersion = ffmpegVersion;
+                    appConfig.Save();
+                }
+                else if (ffmpegDownload is null && !File.Exists(appConfig.Ffmpeg))
+                {
+                    Console.WriteLine("FFmpeg is not installed and no download is configured for this platform.");
+                    errorOccuredDuringStartup = true;
+                }
+            }
+            else if (!File.Exists(appConfig.Ffmpeg))
+            {
+                Console.WriteLine("FFmpeg is not installed and the update response contains no FFmpeg release version. This is a REQUIRED dependancy. Please ensure you manually install this before continuing and consider disabling auto-updates within the app config");
+                errorOccuredDuringStartup = true;
+            }
             Console.Write("\rChecking for updates... This downloader is up to date! Yt-dlp up to date! Ffmpeg up to date! Checking Deno");
-            await updateDeno();
+            ReleaseInfo? denoRelease = updateInfo.Deno;
+            string? denoVersion = denoRelease?.LatestVersion;
+            if (!string.IsNullOrWhiteSpace(denoVersion)
+                && (appConfig.DenoLatestVersion != denoVersion || !File.Exists(appConfig.Deno)))
+            {
+                DependencyDownload? denoDownload = denoRelease!.GetDownload(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), RuntimeInformation.IsOSPlatform(OSPlatform.OSX), RuntimeInformation.OSArchitecture);
+                if (denoDownload is not null && await updateDependency("deno", denoDownload.Url!, denoDownload.Sha256!))
+                {
+                    appConfig.DenoLatestVersion = denoVersion;
+                    appConfig.Save();
+                }
+                else if (denoDownload is null && !File.Exists(appConfig.Deno))
+                {
+                    Console.WriteLine("Deno is not installed and no download is configured for this platform.");
+                    errorOccuredDuringStartup = true;
+                }
+            }
+            else if (!File.Exists(appConfig.Deno))
+            {
+                Console.WriteLine("Deno is not installed and the update response contains no Deno release version. This is a REQUIRED dependancy. Please ensure you manually install this before continuing and consider disabling auto-updates within the app config");
+                errorOccuredDuringStartup = true;
+            }
             Console.Write("\rChecking for updates... This downloader is up to date! Yt-dlp up to date! Ffmpeg up to date! Deno up to date!");
         }
         catch (Exception) {errorOccuredDuringStartup = true;}
@@ -522,7 +574,7 @@ class AppConfig
     private static readonly AppJsonContext JsonContext = new(JsonWriteIndented);
     public bool ErrorOccurredDuringStartup;
 
-    public readonly string  Version = "2.4";
+    public readonly string  Version = "2.4.0";
     public bool UpdateReqsOnStartup {get; set;} = true;
     public string YtDlp {get; set;} = ResolveAppPath(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "yt-dlp.exe" : "yt-dlp");
     public string Ffmpeg {get; set;} = ResolveAppPath(RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? Path.Combine("ffmpeg", "ffmpeg.exe") : Path.Combine("ffmpeg", "ffmpeg"));
@@ -846,10 +898,78 @@ class StreamInfo
 
 class UpdateInfo
 {
-    public string LatestVersion {get; set;} = "";
-    public string WindowsUpdaterUrl {get; set;} = "";
-    public string LinuxUpdaterUrl {get; set;} = "";
-    public string MacUpdaterUrl {get; set;} = "";
+    [JsonPropertyName("self")]
+    public ReleaseInfo? Self {get; set;}
+    [JsonPropertyName("ffmpeg")]
+    public ReleaseInfo? Ffmpeg {get; set;}
+    [JsonPropertyName("deno")]
+    public ReleaseInfo? Deno {get; set;}
+}
+
+class ReleaseInfo
+{
+    [JsonPropertyName("latestVersion")]
+    public string? LatestVersion {get; set;}
+    [JsonPropertyName("windows")]
+    public PlatformDownloads? Windows {get; set;}
+    [JsonPropertyName("linux")]
+    public PlatformDownloads? Linux {get; set;}
+    [JsonPropertyName("mac")]
+    public PlatformDownloads? Mac {get; set;}
+
+    public DependencyDownload? GetDownload(bool isWindows, bool isMac, Architecture architecture)
+    {
+        PlatformDownloads? platform = isWindows ? Windows : isMac ? Mac : Linux;
+        if (platform is null) {return null;}
+
+        IEnumerable<(string? Url, string? Sha256)> candidates = architecture switch
+        {
+            Architecture.X86 => [(platform.X86, platform.X86Hash)],
+            Architecture.X64 => [(platform.X64, platform.X64Hash), (platform.X86, platform.X86Hash)],
+            Architecture.Arm64 when isWindows => [(platform.Arm, platform.ArmHash), (platform.X64, platform.X64Hash), (platform.X86, platform.X86Hash)],
+            Architecture.Arm64 when isMac => [(platform.Arm, platform.ArmHash), (platform.X64, platform.X64Hash)],
+            Architecture.Arm64 => [(platform.Arm, platform.ArmHash)],
+            _ => []
+        };
+
+        foreach ((string? url, string? sha256) in candidates)
+        {
+            if (!string.IsNullOrWhiteSpace(url) && !string.IsNullOrWhiteSpace(sha256))
+            {
+                return new DependencyDownload(url, sha256);
+            }
+        }
+
+        return null;
+    }
+}
+
+class PlatformDownloads
+{
+    [JsonPropertyName("x86")]
+    public string? X86 {get; set;}
+    [JsonPropertyName("x86 hash")]
+    public string? X86Hash {get; set;}
+    [JsonPropertyName("x64")]
+    public string? X64 {get; set;}
+    [JsonPropertyName("x64 hash")]
+    public string? X64Hash {get; set;}
+    [JsonPropertyName("ARM")]
+    public string? Arm {get; set;}
+    [JsonPropertyName("ARM hash")]
+    public string? ArmHash {get; set;}
+}
+
+class DependencyDownload
+{
+    public DependencyDownload(string url, string sha256)
+    {
+        Url = url;
+        Sha256 = sha256;
+    }
+
+    public string Url {get;}
+    public string Sha256 {get;}
 }
 
 class NoConfigFileFound : Exception

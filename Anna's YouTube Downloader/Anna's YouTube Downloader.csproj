@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <Compile Include="..\Program.cs" Link="Program.cs" />
+    <PackageReference Include="SharpCompress" Version="0.50.5" />
   </ItemGroup>
 
 </Project>

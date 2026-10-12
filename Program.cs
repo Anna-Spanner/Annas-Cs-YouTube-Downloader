@@ -15,7 +15,7 @@ Console.WriteLine(welcomeMessage);
 
 var videoFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
-    "avi", "flv", "m4a", "mka", "mkv", "mov", "mp3", "mp4", "ogg", "opus", "webm"
+    "avi", "flv", "m4a", "mka", "mkv", "mov", "mp4", "ogg", "opus", "webm"
 };
 var audioFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 {
@@ -421,7 +421,11 @@ async Task run()
             }
             Console.Write("\rChecking for updates... This downloader is up to date! Yt-dlp up to date! Ffmpeg up to date! Deno up to date!");
         }
-        catch (Exception) {errorOccuredDuringStartup = true;}
+        catch (Exception e)
+        {
+            Console.WriteLine($"Startup update check failed: {e}");
+            errorOccuredDuringStartup = true;
+        }
     }
     else if (!Path.Exists(appConfig.Ffmpeg) || !Path.Exists(appConfig.Deno))
     {
@@ -486,7 +490,7 @@ async Task run()
 
         async void promptWhichBest() 
         {
-            Console.Write("Do you want to use the highest quality available or select your on video and audio streams?\nType \"best-audio\" to save as an audio file with no video feed\nType \"best-video\" to save as a video file with no audio\nType \"best\" to save the best video and auido together\n -> ");
+            Console.Write("Do you want to use the highest quality available or select your on video and audio streams?\nType \"best-audio\" to save as an audio file with no video feed\nType \"best-video\" to save as a video file with no audio\nType \"best\" to save the best video and audio together\n -> ");
             string? useBest = Console.ReadLine();
             switch (useBest?.Trim().ToLowerInvariant())
             {
@@ -567,7 +571,7 @@ try
 
 class AppConfig
 {
-    public static string ApplicationDirectory {get;} = Path.GetFullPath(AppContext.BaseDirectory);
+    public static string ApplicationDirectory {get;} = Path.GetDirectoryName(Environment.ProcessPath)!;
     private static readonly string ConfigLocation = ResolveAppPath("config.json");
     private static readonly string TempConfigLocation = ResolveAppPath("config.json.temp");
     private static readonly JsonSerializerOptions JsonWriteIndented = new() {WriteIndented = true};

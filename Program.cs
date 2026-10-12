@@ -423,7 +423,7 @@ async Task run()
         }
         catch (Exception e)
         {
-            Console.WriteLine($"Startup update check failed: {e}");
+            Console.WriteLine($"{e}\n\nStartup update check failed. This means we cannot check for updates at this time, and it should be safe to continue. To mute this warning, disable updates at startup in the config.");
             errorOccuredDuringStartup = true;
         }
     }

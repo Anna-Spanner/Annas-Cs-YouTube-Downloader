@@ -25,7 +25,8 @@ var audioFormats = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 async Task<UpdateInfo> getLatestUpdateInfo()
 {
     using var client = new HttpClient();
-    string json = await client.GetStringAsync("https://annaspannertechsolutions.uk/annas-youtube-downloader/latest");
+    string url = "https://annaspannertechsolutions.uk/annas-youtube-downloader/latest" + "?channel=debug";
+    string json = await client.GetStringAsync(url);
     return JsonSerializer.Deserialize(json, AppJsonContext.Default.UpdateInfo)
         ?? throw new InvalidDataException("The update server returned an empty response.");
 }
